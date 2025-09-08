@@ -166,6 +166,7 @@
                                         <th>成交量</th>
                                         <th>成交额</th>
                                         <th>成交额占比(%)</th>
+                                        <th>交易时间</th>
                                         <th>时间</th>
                                     </tr>
                                 </thead>
@@ -472,7 +473,10 @@
                                 turnoverRatio = ratio.toFixed(4) + '%';
                             }
                             
-                            // 格式化时间
+                            // 格式化交易时间 (time_full)
+                            const tradeTime = option.time_full || '';
+                            
+                            // 格式化检测时间 (timestamp)
                             const timestamp = option.timestamp ? 
                                 new Date(option.timestamp).toLocaleString('zh-CN', { 
                                     hour12: false,
@@ -497,6 +501,7 @@
                                 <td>${option.volume || ''}</td>
                                 <td>${option.turnover ? formatNumber(option.turnover) : ''}</td>
                                 <td><span class="turnover-ratio">${turnoverRatio}</span></td>
+                                <td>${tradeTime}</td>
                                 <td>${timestamp}</td>
                             `;
                             
@@ -504,7 +509,7 @@
                         });
                     } else {
                         const row = document.createElement('tr');
-                        row.innerHTML = '<td colspan="13" class="text-center text-muted">暂无大单期权数据</td>';
+                        row.innerHTML = '<td colspan="14" class="text-center text-muted">暂无大单期权数据</td>';
                         tableBody.appendChild(row);
                     }
                 })
