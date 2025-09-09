@@ -8,6 +8,7 @@ import os
 import logging
 from typing import Dict
 from config import DATA_CONFIG
+from utils.mysql_handler import MySQLHandler
 
 
 class DataHandler:
@@ -16,6 +17,20 @@ class DataHandler:
     def __init__(self):
         self.logger = logging.getLogger('OptionMonitor.DataHandler')
         self._ensure_data_directory()
+        
+        # 初始化MySQL处理器
+        self.mysql_handler = None
+        if DATA_CONFIG.get('save_to_db', False):
+            try:
+                self.mysql_handler = MySQLHandler()
+                if self.mysql_handler.connect():
+                    self.logger.info("MySQL数据库处理器初始化成功")
+                else:
+                    self.logger.warning("MySQL数据库连接失败，将使用文件存储")
+                    self.mysql_handler = None
+            except Exception as e:
+                self.logger.error(f"MySQL数据库处理器初始化失败: {e}")
+                self.mysql_handler = None
     
     def _ensure_data_directory(self):
         """确保数据目录存在"""
@@ -52,13 +67,42 @@ class DataHandler:
             self.logger.error(f"保存CSV数据失败: {e}")
     
     def _save_to_database(self, trade_info: Dict):
-        """保存到数据库（可扩展）"""
-        # 这里可以实现数据库存储逻辑
-        # 例如：SQLite, MySQL, PostgreSQL等
-        pass
+        """保存到数据库"""
+        if not self.mysql_handler:
+            self.logger.warning("MySQL处理器未初始化，跳过数据库保存")
+            return False
+        
+        try:
+            # 保存期权交易数据
+            success = self.mysql_handler.save_option_trade(trade_info)
+            if success:
+                self.logger.debug(f"交易数据已保存到数据库: {trade_info.get('option_code', 'Unknown')}")
+            else:
+                self.logger.error(f"保存交易数据到数据库失败: {trade_info.get('option_code', 'Unknown')}")
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"保存数据库数据失败: {e}")
+            return False
     
     def load_historical_data(self, days: int = 7) -> pd.DataFrame:
-        """加载历史数据"""
+        """加载历史数据（优先从数据库，降级到CSV）"""
+        # 优先从数据库加载
+        if self.mysql_handler and DATA_CONFIG.get('save_to_db', False):
+            try:
+                trades_data = self.mysql_handler.get_recent_trades(hours=days * 24)
+                if trades_data:
+                    df = pd.DataFrame(trades_data)
+                    # 转换时间戳列名以保持兼容性
+                    if 'trade_time' in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['trade_time'])
+                    self.logger.debug(f"从数据库加载了 {len(df)} 条历史数据")
+                    return df
+            except Exception as e:
+                self.logger.error(f"从数据库加载历史数据失败: {e}")
+        
+        # 降级到CSV文件
         try:
             if not DATA_CONFIG['save_to_csv'] or not os.path.exists(DATA_CONFIG['csv_path']):
                 return pd.DataFrame()
@@ -72,6 +116,7 @@ class DataHandler:
             cutoff_date = pd.Timestamp.now() - pd.Timedelta(days=days)
             recent_data = df[df['timestamp'] >= cutoff_date]
             
+            self.logger.debug(f"从CSV文件加载了 {len(recent_data)} 条历史数据")
             return recent_data
             
         except Exception as e:

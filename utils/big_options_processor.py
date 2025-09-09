@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from config import DATA_CONFIG, MONITOR_TIME, OPTION_FILTER
 import futu as ft
+from utils.data_handler import DataHandler
 
 
 class BigOptionsProcessor:
@@ -24,6 +25,9 @@ class BigOptionsProcessor:
         self.json_file = DATA_CONFIG['big_options_json']
         self.stock_price_cache = {}  # 缓存股价信息
         self.price_cache_time = {}   # 缓存时间
+        
+        # 初始化数据处理器用于数据库存储
+        self.data_handler = DataHandler()
         self.last_option_volumes = {}  # 缓存上一次的期权交易量
     
     def _load_stock_info_from_file(self, stock_code: str) -> Optional[Dict[str, Any]]:
@@ -907,7 +911,7 @@ class BigOptionsProcessor:
             return []
     
     def save_big_options_summary(self, big_options: List[Dict[str, Any]]):
-        """保存大单期权汇总到JSON文件"""
+        """保存大单期权汇总到JSON文件和数据库"""
         try:
             # 准备汇总数据
             summary = {
@@ -943,6 +947,20 @@ class BigOptionsProcessor:
             with open(self.json_file, 'w', encoding='utf-8') as f:
                 json.dump(summary, f, ensure_ascii=False, indent=2, default=json_serializer)
             
+            # 保存每个大单期权到数据库
+            if DATA_CONFIG.get('save_to_db', False) and big_options:
+                saved_count = 0
+                for option_data in big_options:
+                    try:
+                        # 准备数据库存储格式
+                        trade_info = self._prepare_trade_data_for_db(option_data)
+                        if self.data_handler.save_trade(trade_info):
+                            saved_count += 1
+                    except Exception as e:
+                        self.logger.error(f"保存单个期权数据到数据库失败: {e}")
+                
+                self.logger.info(f"已保存 {saved_count}/{len(big_options)} 条期权数据到数据库")
+            
             self.logger.info(f"大单期权汇总已保存: {len(big_options)}笔交易")
             
         except Exception as e:
@@ -950,23 +968,167 @@ class BigOptionsProcessor:
             import traceback
             self.logger.error(traceback.format_exc())
     
+    def _prepare_trade_data_for_db(self, option_data: Dict[str, Any]) -> Dict[str, Any]:
+        """将期权数据转换为数据库存储格式"""
+        try:
+            # 解析期权类型
+            option_code = option_data.get('option_code', '')
+            option_type = 'Call' if 'C' in option_code.upper() else 'Put' if 'P' in option_code.upper() else 'Unknown'
+            
+            # 解析执行价格
+            strike_price = self._parse_strike_from_code(option_code)
+            
+            # 解析到期日期（从期权代码中提取）
+            expiry_date = self._parse_expiry_from_code(option_code)
+            
+            # 计算距离到期天数
+            time_to_expiry = None
+            if expiry_date:
+                try:
+                    expiry_dt = datetime.strptime(expiry_date, '%Y-%m-%d')
+                    time_to_expiry = (expiry_dt - datetime.now()).days
+                except:
+                    pass
+            
+            # 准备数据库格式
+            trade_data = {
+                'trade_time': datetime.now(),
+                'stock_code': option_data.get('stock_code', ''),
+                'stock_name': option_data.get('stock_name', ''),
+                'stock_price': option_data.get('stock_price'),
+                'option_code': option_code,
+                'option_type': option_type,
+                'strike_price': strike_price,
+                'expiry_date': expiry_date,
+                'volume': option_data.get('volume', 0),
+                'turnover': option_data.get('turnover', 0),
+                'premium': option_data.get('premium', 0),
+                'trade_direction': option_data.get('trade_direction', ''),
+                'bid_price': option_data.get('bid_price'),
+                'ask_price': option_data.get('ask_price'),
+                'last_price': option_data.get('last_price'),
+                'change_rate': option_data.get('change_rate'),
+                'implied_volatility': option_data.get('implied_volatility'),
+                'delta_value': option_data.get('delta_value'),
+                'gamma_value': option_data.get('gamma_value'),
+                'theta_value': option_data.get('theta_value'),
+                'vega_value': option_data.get('vega_value'),
+                'open_interest': option_data.get('open_interest'),
+                'time_to_expiry': time_to_expiry,
+                'moneyness': self._calculate_moneyness(option_data.get('stock_price'), strike_price, option_type),
+                'data_source': 'futu'
+            }
+            
+            return trade_data
+            
+        except Exception as e:
+            self.logger.error(f"准备数据库存储格式失败: {e}")
+            # 返回基本格式
+            return {
+                'trade_time': datetime.now(),
+                'stock_code': option_data.get('stock_code', ''),
+                'stock_name': option_data.get('stock_name', ''),
+                'option_code': option_data.get('option_code', ''),
+                'option_type': 'Unknown',
+                'volume': option_data.get('volume', 0),
+                'turnover': option_data.get('turnover', 0),
+                'data_source': 'futu'
+            }
+    
+    def _parse_expiry_from_code(self, option_code: str) -> Optional[str]:
+        """从期权代码解析到期日期"""
+        try:
+            # 港股期权代码格式: HK.00700C2024123000365
+            # 00700 = 股票代码, C = 期权类型, 20241230 = 到期日期, 00365 = 执行价格
+            if option_code.startswith('HK.'):
+                code_part = option_code[3:]
+                
+                # 使用正则表达式匹配完整格式
+                m = re.match(r'(\d{5})([CP])(\d{8})(\d{5})$', code_part)
+                if m:
+                    date_str = m.group(3)  # 获取8位日期
+                    # 格式化为 YYYY-MM-DD
+                    year = date_str[:4]
+                    month = date_str[4:6] 
+                    day = date_str[6:8]
+                    return f"{year}-{month}-{day}"
+                
+                # 备用方案：找到C/P后的部分
+                opt_pos = max(code_part.rfind('C'), code_part.rfind('P'))
+                if opt_pos != -1:
+                    after_opt = code_part[opt_pos + 1:]
+                    # 提取前8位数字作为日期
+                    if len(after_opt) >= 8:
+                        date_str = after_opt[:8]
+                        if date_str.isdigit():
+                            # 格式化为 YYYY-MM-DD
+                            year = date_str[:4]
+                            month = date_str[4:6]
+                            day = date_str[6:8]
+                            return f"{year}-{month}-{day}"
+        except Exception as e:
+            self.logger.debug(f"解析期权到期日期失败: {e}")
+        
+        return None
+    
+    def _calculate_moneyness(self, stock_price: Optional[float], strike_price: Optional[float], option_type: str) -> str:
+        """计算期权价值状态"""
+        if not stock_price or not strike_price:
+            return 'Unknown'
+        
+        try:
+            if option_type == 'Call':
+                if stock_price > strike_price:
+                    return 'ITM'  # In The Money
+                elif abs(stock_price - strike_price) / strike_price < 0.02:  # 2%以内认为是平价
+                    return 'ATM'  # At The Money
+                else:
+                    return 'OTM'  # Out of The Money
+            elif option_type == 'Put':
+                if stock_price < strike_price:
+                    return 'ITM'
+                elif abs(stock_price - strike_price) / strike_price < 0.02:
+                    return 'ATM'
+                else:
+                    return 'OTM'
+            else:
+                return 'Unknown'
+        except:
+            return 'Unknown'
+    
     def _parse_strike_from_code(self, option_code: str) -> float:
-        """从期权代码解析执行价格（使用末尾的 C/P 标识）"""
+        """从期权代码解析执行价格"""
         try:
             if option_code.startswith('HK.'):
                 code_part = option_code[3:]  # 去掉 HK.
-                # 优先用正则匹配末尾的 C/P + 数字
-                m = re.search(r'([CP])(\d+)$', code_part)
+                
+                # 港股期权代码格式分析: HK.00700C2024123000365
+                # 00700 = 股票代码
+                # C = 期权类型 
+                # 20241230 = 到期日期
+                # 00365 = 执行价格 (365.0)
+                
+                # 使用正则表达式匹配完整格式
+                m = re.match(r'(\d{5})([CP])(\d{8})(\d{5})$', code_part)
                 if m:
-                    digits = m.group(2)
-                    return float(digits) / 1000.0
-                # 回退：取最后一个 C 或 P 之后的所有数字
+                    price_str = m.group(4)  # 获取5位价格数字
+                    # 去掉前导零并转换为正确的价格
+                    price_int = int(price_str)
+                    return float(price_int)  # 365.0
+                
+                # 备用方案：找到C/P后的部分
                 opt_pos = max(code_part.rfind('C'), code_part.rfind('P'))
                 if opt_pos != -1:
-                    tail = code_part[opt_pos + 1:]
-                    digits = ''.join(ch for ch in tail if ch.isdigit())
-                    if digits:
-                        return float(digits) / 1000.0
+                    after_cp = code_part[opt_pos + 1:]
+                    if len(after_cp) >= 13:  # 8位日期 + 5位价格
+                        price_part = after_cp[-5:]  # 取最后5位作为价格
+                        if price_part.isdigit():
+                            return float(int(price_part))  # 00365 -> 365.0
+                    elif len(after_cp) >= 11:  # 8位日期 + 3位价格  
+                        price_part = after_cp[-3:]  # 取最后3位作为价格
+                        if price_part.isdigit():
+                            return float(int(price_part))  # 365 -> 365.0
+                        
         except Exception as e:
             self.logger.debug(f"解析执行价格失败: {e}")
         return 0.0
